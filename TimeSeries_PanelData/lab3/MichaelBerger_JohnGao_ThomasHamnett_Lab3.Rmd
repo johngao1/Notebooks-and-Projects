@@ -1,0 +1,770 @@
+---
+title: 'Statistical Methods for Discrete Response, Time Series, and Panel Data (W271):
+  Lab 3'
+author: "Michael Berger, John Gao, and Thomas Hamnett"
+header-includes:
+   -  \usepackage{dcolumn}
+output: 
+  pdf_document:
+  toc: true
+  number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+---
+
+\tableofcontents
+\newpage
+
+# Question 1: Forecasting using a Seasonal ARIMA model
+
+## Introduction
+
+In this third lab, first question, we will look into the quarterly data of e-commerce retail sales as a percent of total retail sales. The data can be found at: https://fred.stlouisfed.org/series/ECOMPCTNSA. We will build a **Seasonal Autoregressive Integrated Moving Average** (SARIMA) model. We will first load the necessary libraries as well as the data and explore the data. We will transform the data to a time series and withhold data of 2015 and 2016 as test set. Then we will conduct an **Exploratory Time Series Data Analysis** (ETSDA). Based on our insights from ETSDA as well as using an automatic search based on the Akaike information criterion with correction (AICc), we will then specify several candidate models. Next we will evaluate the models based on AIC and the Bayesian Information Criterion (BIC) and select our baseline model. After that we will explore in-sample-fit measures as well as the behavior of the residuals in order to explore whether the modelling assumptions are met. In addition, we will compare the forecast of the model on the test set using the **Root Mean Squared Error** (RMSE) as measure. We will discuss the performance. In case the residuals are well behaved and the out-of-sample test appears reasonable, we will finally produce the forecast for 2017. 
+
+## Start Up Code
+
+```{r global_options}
+library(knitr); opts_chunk$set(tidy.opts=list(width.cutoff=60),
+                               tidy=T,warning=FALSE,message=FALSE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+# cleaning workspace; Loading required libraries 
+rm(list = ls())
+libs <- c('ggplot2', 'ggfortify', 'plotly', 'dplyr', 'astsa','fpp2','tidyr', 'tseries', 'forecast', 'gridExtra')
+for (lib in libs) {require(lib, character.only = TRUE)}
+```
+
+## Data Loading and Inspection
+
+```{r}
+# Loading the data
+df <- read.csv("ECOMPCTNSA.csv", header = TRUE, sep = ",")
+# inspecting it
+str(df); head(df,4); tail(df,4); any(is.na(df))
+```
+
+The data is stored as a `dataframe`. We note that the first observation is 10/01/1999 and no missing values are present in the data. The data ranges from 0.7 to 9.5 with a mean of 3.835 and a median of 3.6. The data ends in the fourth quarter 2016. The frequency of the data is quarterly.
+
+Next we convert the data into a time series object and check that the transformation was successful.
+
+```{r}
+# converting data to quarterly time series starting 1st Oct 1999,
+# hence 4th Quarter 1999
+df.ts <- ts(df$ECOMPCTNSA, start = c(1999,4), frequency = 4)
+# inspecting transformed data
+str(df.ts)
+```
+
+The transformation yielded a time series object. Next, we subset the data to only include the data up to end 2014. We will keep 2015 and 2016 for out-of-sample testing and train the model on the remaining data.
+
+```{r}
+# Subsetting to training data
+df.ts.train <- window(df.ts, end=c(2014,4))
+```
+
+Next we conduct the ETSDA.
+
+## Exploratory Time Series Data Analysis
+
+```{r, fig.width = 7, fig.height = 2}
+# Helper functions for visualizations
+gHist <- function(input, title, nbin) {
+  input %>% as.data.frame() %>% ggplot(aes(x = input)) +
+  ggtitle(title) + ylab("Frequency") + xlab("Percentage of Total Sales") +
+  geom_histogram(col = 'white', fill = 'navy', bins=nbin) +
+  theme(plot.title = element_text(size=10),
+        axis.title = element_text(size = rel(.8)))
+}
+gTs <- function(input, title) {
+  input %>% as.data.frame() %>% ggplot(aes(x = time(input), y = input)) + 
+  ylab("Percentage of\nTotal Sales") + xlab("Quarters") + ggtitle(title) + 
+  geom_smooth(method="lm", se = FALSE, col = 'navy', lty = 2, size = 0.5) +
+  geom_line() + theme(plot.title = element_text(size=10),
+                      axis.title = element_text(size = rel(.8)))
+}
+
+g1 <- gHist(df.ts.train, 'Histogram of E-Commerce \nRetail Sales', 9)
+g2 <- gTs(df.ts.train, 'Time Series Plot of E-Commerce \nRetail Sales') +
+  geom_smooth(method="lm", formula = y ~ x + I(x^2),
+              se = FALSE, col = 'red', lty = 2, size = 0.5)
+grid.arrange(g1, g2, ncol=2)
+```
+
+The histogram of the data looks skewed to the left with right tail. The time series plot shows a trend, which appears to be quadratic rather than linear. In addition, a seasonal pattern seems to be in place and the variance seems to be increasing with time. Hence, we might need to transform the data to deal with the increasing variance as well as explore whether first-differencing might remove the trend in order to yield a stationary series.
+
+First, however, we explore the seasonality of the data.
+
+```{r,fig.width = 7, fig.height = 2}
+# Examining seasonality
+g1 <- ggseasonplot(df.ts.train, year.labels = TRUE,
+                   year.labels.left = TRUE) +
+  ylab("Percentage of\nTotal Sales") +
+  ggtitle("Seasonal plot: E-Commerce Retail Sales") +
+  theme(plot.title = element_text(size=10),
+        axis.title = element_text(size=8))
+cy <- cycle(df.ts.train)
+g2 <- df.ts.train %>% as.data.frame() %>%
+  ggplot(aes(x=cy, y=df.ts.train, group=cy)) + scale_x_continuous(breaks=cy) +
+  ggtitle('Boxplot: E-Commerce Retail Sales') + geom_boxplot() + 
+  ylab("Percentage of\nTotal Sales") + xlab("Quarter") +
+  theme(plot.title=element_text(size=10), axis.title=element_text(size=8))
+grid.arrange(g1, g2, ncol=2, nrow=1)
+```
+
+We again note the trend in the season plot. In the boxplot, we note a slight seasonal change, especially with higher median and higher inter-quartile-range for the fourth quarter.
+
+```{r, fig.width = 7, fig.height = 4}
+decomp <- fortify(decompose(df.ts.train, type="multiplicative"))
+ggplot(gather(decomp, key, value, -Index), aes(Index, value)) +
+  facet_grid(factor(key, levels=c("Data","trend","seasonal",
+                                  "remainder"))~ ., scales="free_y") +
+  geom_line(na.rm = T) + ggtitle("Decomposed Multiplicative Time Series") +
+  theme_bw() + ylab("Percentage of Total Sales") + xlab("Quarter") +
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+We decomposed the time series into seasonal, trend, and remainder compoenents using a multiplicative decomposition. We chose mulitplicative decomposition due to observing that the seasonality appeared to increase as the level of the data increased; that is, seasnoality appeared to be more a percetnage of level than having a constant magnitude.  Of note, the seasonal component ranges from -8% to +12%, a relatively small effect given the difference in level of >10x in the actual data (min: 0.7; max: 7.7).  Also, the remainder is more variable at the start and end of the series than the middle.  This suggests, using this decomposition, the reamining error is not random.  Remainder varies from -5% to +4%, which is realtively low compared to the seasonal component and suggests the trend and seasonal components do reasonably good job at explaining the time series data.
+
+```{r, fig.width = 7, fig.height = 2}
+g1 <- ggAcf(df.ts.train, main = 'ACF Plot')
+g2 <- ggPacf(df.ts.train, main = 'PACF Plot')
+grid.arrange(g1, g2, ncol=2)
+```
+
+When looking at the ACF plot, we see it is trailing off, while the PACF plot shows significant spikes at lag 1 and lag 5, indicating seasonal effects. Besides the visual inspection, we also run the Augmented Dickey-Fuller-test to check for stationaity.
+
+```{r}
+adf.test(df.ts.train, alternative = 'stationary')$p.value
+```
+
+As seen in the visual inspection, the null hypothesis that time series is not stationary is not rejected given a very high p-value. 
+
+Given above analysis, we want now to check whether first-differencing would remove the trend and produce a stationary series. In addition, in order to deal with the increasing variance, we want to check whether a log-transformation can stabilize the variance. Hence, we try the first-differencing of the log-transformed series, denoted $x_t$, as transformation:
+
+\[log(x_t) - log(x_{t-1})= log(\frac{x_t}{x_{t-1}})\]
+
+This yields the following time series plot.
+
+```{r, fig.width = 7, fig.height = 2}
+trans.df.ts <- diff(log(df.ts.train))
+print(gTs(trans.df.ts, 'First Difference of Log of E-Commerce Retail Sales') +
+  ylab("Log of Percentage\nof Total Sales"))
+```
+
+First-differencing of logs of the series seems to remove a big part of the trend and indeed stabilizes the variance.
+
+```{r, fig.width = 7, fig.height = 2}
+g1 <- ggAcf(trans.df.ts, main = 'ACF Plot')
+g2 <- ggPacf(trans.df.ts, main = 'PACF Plot')
+grid.arrange(g1, g2, ncol=2)
+```
+
+The first-difference of log of series still indicates the seasonal effect based on the ACF plot and shows negative partial autocrrelation with second and third lag and positive partial autocorrelation with fourth lag based on the PACF plot. Hence, the transformed series still shows a seasonal component.
+
+We now test the transformed series in respect to stationarity.
+
+```{r}
+adf.test(trans.df.ts, alternative = 'stationary')$p.value
+```
+
+We see that the null hypothesis of non-stationarity is rejected. Hence, first-difference of log seems to have resulted in a stationary time series with seasonal component. We will also consider a Box-Cox transformation to see, if it suggests a  different result for the transformation.
+
+```{r}
+log.df.ts <- log(df.ts.train); lam <- BoxCox.lambda(df.ts.train)
+BC.df.ts <- BoxCox(df.ts.train,lam); lam
+mean((BC.df.ts-log.df.ts)) #Avg Difference between log and BC
+```
+
+We see that the suggestion is lambda = 0.015 for the Box-Cox transformation which is very close a log-transfromation (where lambda = 0 for Box-Cox).  On average it also provides slighlty higher values after transformation of ~0.1 (although differences early in the time series are lower).
+
+For interpretability, we will continue with the log transformation. The trade-off is that we might have a slightly better model performance with the Box-Cox transform, but the log transform is easier to interpret and explain as it models the percentage in differences.
+
+Hence, we will use a log-transformed time series and apply a *seasonal ARIMA* model with $I(1)$.For a log-transformed time series $log(x_t)$ for which $d$th differencing yields an $ARMA(p,q)$ model, with seasonal component, the model is defined as:
+
+\[\Theta_P(B^s)\Theta_p(B)(1 - B^s)^D(1 - B)^d log(x_t) = \Phi_Q(B^s)\Phi_q(B)w_t \]
+
+with $p$, $d$ and $q$ relating to the non-seasonal and $P$, $D$, $Q$ relating to the seasonal part of the model. Based on this model family and the ETSDA, we build several candidate models as well as use the `auto.arima` function to specify a candidate model based on the AICc, the AIC and the BIC.
+
+## Model Building
+
+```{r}
+p1 = q1 = P1 = Q1 = 0:2; d1 = D1 = 0:1 #testing different parameters
+fAIC <- function(x, mod,ic) {
+  tmp <- try(Arima(mod, order=c(x[1],x[2],x[3]),
+                   seasonal=c(x[4],x[5],x[6])),TRUE)
+  if(isTRUE(class(tmp)=="try-error")) { return(NA) } #error handling
+  else { ifelse(ic == "BIC", return(round(BIC(tmp),2)),
+                return(round(AIC(tmp),2))) } #BIC or AIC
+}
+mod_df <- expand.grid(p=p1,d=d1,q=q1,P=P1,D=D1,Q=Q1)
+mod_df$AIC <- apply(mod_df, MARGIN = 1, fAIC, mod=log.df.ts, ic="AIC")
+mod_df$BIC <- apply(mod_df, MARGIN = 1, fAIC, mod=log.df.ts, ic="BIC")
+#Top candidate models by AIC and BIC
+head(mod_df %>% arrange(AIC),4); head(mod_df %>% arrange(BIC),4)
+mod.auto <- auto.arima(log.df.ts)
+setNames(data.frame(matrix(mod.auto$arma, nrow=1)),
+         c('p','q','P','Q','S','d','D')) #auto.arima parameters
+AIC(mod.auto); BIC(mod.auto) #auto.arima AIC and BIC
+```
+
+After training the models, we will now select the most parsimonous model within the range of the best AIC and BIC performances.
+
+## Model Selection
+
+We see that $ARIMA(0,1,0)(1,0,2)[4]$ has the lowest AIC and $ARIMA(0,1,0)(2,0,0)[4]$ has the lowest BIC (and third lowest AIC). The `auto.arima` function suggests $ARIMA(0,1,0)(2,1,0)[4]$, which yields the lowest AICc.  As we want to select the most parsimonous model within the best performances, we select $ARIMA(0,1,0)(2,0,0)[4]$ as our baseline model.  
+
+```{r}
+baseline <- Arima(log.df.ts, order = c(0,1,0), seasonal = c(2,0,0))
+summary(baseline)
+```
+
+We see that both seasonal autoregressive variables are statistically significant. `sar2` appears relatively to be more significant given the computed standard error.
+
+We next evaluate the model and look at the residuals.
+
+## Model Evaluation and Assumption Testing
+
+```{r, fig.width = 7, fig.height = 2}
+fitted.values <- exp(fitted(baseline))
+print(gTs(df.ts.train, 'Actual vs Fitted with ARIMA(0,1,0)(2,0,0)[4]') +
+  geom_line(aes(x=time(df.ts.train), y=fitted.values), col='darkgreen'))
+```
+
+We see that the model together with the log-transformation follows the time series pattern of the training data very closely and captures the increasing variance and seasonal patterns quite well. 
+
+```{r, fig.width = 7, fig.height = 2}
+res.baseline <- exp(residuals(baseline))-1
+print(gTs(res.baseline, 'Residuals of Fitted Values: ARIMA(0,1,0)(2,0,0)[4]'))
+mean(res.baseline)
+```
+
+We see from the residual time series plot that the residuals still have a skew towards negative values and the volatility is decreasing. This indicates that the residuals are not necessarily white noise.  
+
+```{r, fig.width = 7, fig.height = 2}
+g1 <- gHist(res.baseline, 'Histogram of Residuals', 9)
+g2 <- ggplot(fortify(res.baseline), aes(sample=Data)) + ylab("Actual") + 
+  stat_qq() + stat_qq_line(color='red') + ggtitle("QQ Plot of Residuals") + 
+  xlab("Theoretical") + theme(plot.title = element_text(size = 10),
+                              axis.title = element_text(size = 10))
+grid.arrange(g1, g2, ncol=2)
+```
+
+The histogram of residuals highlights the negative skew of residuals, there are tails on the right and left. This is also supported when looking at the normal Q-Q plot.
+
+```{r, fig.width = 7, fig.height = 2}
+g1 <- ggAcf(res.baseline, main = 'ACF Plot for Residuals', lag.max = 10)
+g2 <- ggPacf(res.baseline, main = 'PACF Plot for Residuals', lag.max = 10)
+grid.arrange(g1, g2, ncol=2)
+Box.test(res.baseline, type="Ljung-Box")$p.value
+```
+
+
+When looking at the ACF and PACF plots, however, we see that no lag is significant. The Box-Ljung test rejects the null hypothesis that the residuals are non-stationary at the 10% level, but not at the 5% level.
+
+```{r}
+res.auto <- exp(residuals(mod.auto))-1
+Box.test(res.auto, type="Ljung-Box")$p.value
+```
+
+When re-evaluating the models we see that the autoselected $ARIMA(0,1,0)(2,1,0)[4]$ model would also reject the null-hypothesis of non-stationary residuals at the 10% level, but not the 5% level (with a higher p-value than our baseline model). The residual plots would not look much different from above. As both models indicate a similar structure of the residuals, we decided to go with the more parsimonous $ARIMA(0,1,0)(2,0,0)[4]$ model for the out-of-sample evaluation and the forecasting. We think that for the forecast a more parsimonous model might generalize better and hence do better in forecasting due to less parameters to be fitted.
+
+```{r, fig.width = 7, fig.height = 2}
+test.forecast <- forecast(baseline, h=8)
+fdf <- function(input, fcst) {
+  out1 <- data.frame(time=time(input), values =input)
+  out2 <- data.frame(time_mean=time(fcst$mean), values_mean=exp(fcst$mean),
+                     time_upper=time(fcst$mean),time_lower=time(fcst$mean),
+                     values_upper=exp(fcst$upper[,'95%']),
+                     values_lower=exp(fcst$lower[,'95%']))
+  return(list(out1, out2))
+}
+df1 <- fdf(df.ts, test.forecast)
+gFcst <- function(input, pred) {
+  ggplot(input, aes(x = time, y = values)) + geom_line(colour='blue') +
+  geom_smooth(aes(x=time_mean, y=values_mean,
+                  ymax=values_upper, ymin=values_lower),
+              colour='red', data=pred, stat='identity') +
+  ggtitle('Actual (blue) vs Predicted (red) with 95% CI') +
+  ylab("Percentage of\nTotal Sales") + xlab("Quarters")
+}
+print(gFcst(df1[[1]], df1[[2]]))
+```
+
+For the out-of-sample testing we see that the mean of the forecast follows the actual values quite closely and the actual values are always within the 95% quantile. However, the downswings are less profound in the actual data compared to the model. This may indicate there is a larger underlying trend increase than captured in our log transformed model.  The Box-Cox transformation may be necessary to better capture the true trend, since we saw that it yielded higher values than the log transform. We also note that each estimate is below the actual data, which will need to be considered when applying the model to the respective business problem (the model is then more conservative in terms of the forecast of the e-commerce percentage of total retail sales).
+
+We calculate the RMSE as a metric of how well our model performs on the test data. The RMSE is defined as follows:
+
+\[RMSE = \sqrt{\frac{1}{T} \sum_{t = 1}^T(\hat{x_t} - x_t)^2}\]
+
+with $T$ being the number of time observations, $\hat{x_t}$ the fitted values and $x_t$ the observed values. RMSE yields the average deviation of our model's forecasted percentage of e-commerce of total retail sales relative to the actual percentage of total sales.
+
+```{r}
+y <- window(df.ts, start=c(2015,1))
+y_hat <- tail(exp(test.forecast$mean),8)
+sqrt(mean((y - y_hat)^2)) #RMSE
+```
+
+
+The RMSE is 0.31. This means in average the model's forecast on the test data is 0.31 percentage points off in respect of the percentage of e-commerce of the total retail sales. We consider this to be a good performance in general, but it depends on the business problem to be solved whether the performance would be judged to be sufficient.
+
+We will use this model for forecasting the 2017 values.
+
+## Forecasting
+
+```{r, fig.width = 7, fig.height = 2}
+model.complete <- Arima(log(df.ts), order = c(0,1,0), 
+                        seasonal = c(1,1,0))
+forecast.2017 = forecast(model.complete, h=4) # forecast 2017
+df1 <- fdf(df.ts, forecast.2017)
+print(gFcst(df1[[1]], df1[[2]]) +
+  ggtitle('Forecast for 2017 with 95% CI'))
+```
+
+For the forecast we see that the model assumes the seasonal pattern to continue with a downswing in the first quarters and a strong upswing in the second half of the year.
+
+## Conclusion
+
+We examined the quarterly data of E-Commerce Retail Sales, first splitting the data into test (last two years) and training sets. We found that the training data shows a trend and an increase in variance over time. By first-differencing the log of the data we could stabilize the variance and remove the trend resulting in a stationary model. In addition, we found seasonal patterns while conducting the ETSDA. Hence, we decided to fit a seasonal ARIMA model to the log-transformed data. 
+
+We found two candidate models, $ARIMA(0,1,0)(2,0,0)[4]$ and $ARIMA(0,1,0)(2,1,0)[4]$, which are quite close in terms of AIC and BIC. We decided to use $ARIMA(0,1,0)(2,0,0)[4]$ as baseline model as it is more parsimonous. 
+
+We then evaluated the model and found that it fits the training data very well, while the residuals look somewhat normal, albeit with longer tails on both sides. In addition, the Box-Ljung test fails to reject non-stationarity at the 5% level (but does so at the 10% level). Nevertheless, the out-of-sample performance based on RMSE is good in our mind. Thus, we used this model to conduct the 2017 forecast. The forecast predicts the trend, increase in variance and the seasonal pattern to hold with a downswing in the first half and a strong upswing in the second half of 2017.
+
+\newpage
+
+# Question 2: Learning how to use the xts library
+
+## Materials covered in Question 2 of this lab
+
+  - Primarily the references listed in this document:
+
+      - "xts: Extensible Time Series" by Jeffrey A. Ryan and Joshua M. Ulrich. 2008. (xts.pdf)
+      - "xts FAQ" by xts Development Team. 2013 (xts_faq.pdf)
+      - xts_cheatsheet.pdf
+
+# Task 1:
+
+1. Read 
+  + The **Introduction** section (Section 1), which only has 1 page of reading of xts: Extensible Time Series" by Jeffrey A. Ryan and Joshua M. Ulrich
+  + The first three questions in "xts FAQ"
+    + What is xts?
+    + Why should I use xts rather than zoo or another time-series package?
+    + How do I install xts?
+  + The "A quick introduction to xts and zoo objects" section in this document
+        
+2. Read the "A quick introduction to xts and zoo objects" of this document
+
+# A quick introduction to xts and zoo objects
+
+### xts
+```xts```
+  - stands for eXtensible Time Series
+  - is an extended zoo object
+  - is essentially matrix + (time-based) index (aka, observation + time)
+
+  - xts is a constructor or a subclass that inherits behavior from parent (zoo); in fact, it extends the popular zoo class. As such. most zoo methods work for xts
+  - is a matrix objects; subsets always preserve the matrix form
+  - importantly, xts are indexed by a formal time object. Therefore, the data is time-stamped
+  - The two most important arguments are ```x``` for the data and ```order.by``` for the index. ```x``` must be a vector or matrix. ```order.by``` is a vector of the same length or number of rows of ```x```; it must be a proper time or date object and be in an increasing order
+
+# Task 2:
+
+1. Read 
+  + Section 3.1 of "xts: Extensible Time Series" by Jeffrey A. Ryan and Joshua M. Ulrich
+  + The following questions in "xts FAQ"
+    + How do I create an xts index with millisecond precision?
+    + OK, so now I have my millisecond series but I still can't see the milliseconds displayed. What went wrong?
+
+2. Follow the following section of this document
+
+# Creating an xts object and converting to an xts object from an imported dataset
+
+We will create an `xts` object from a matrix and a time index. First, let's create a matrix and a time index.  The matrix, as it creates, is not associated with the time index yet.
+
+```{r}
+# Create a matrix
+x <- matrix(rnorm(200), ncol=2, nrow=100)
+colnames(x) <- c("Series01", "Series02")
+str(x)
+head(x,10)
+
+idx <- seq(as.Date("2015/1/1"), by = "day", length.out = 100)
+str(idx)
+head(idx)
+tail(idx)
+```
+
+In a nutshell, `xts` is a matrix indexed by a time object. To create an xts object, we "bind" the object with the index.  Since we have already created a matrix and a time index (of the same length as the number of rows of the matrix), we are ready to "bind" them together. We will name it *X*.
+
+```{r}
+library(xts)
+X <- xts(x, order.by=idx)
+str(X)
+head(X,10)
+```
+As you can see from the structure of an `xts` objevct, it contains both a data component and an index, indexed by an objevct of class `Date`.
+
+**xtx constructor**
+```
+xts(x=Null,
+    order.by=index(x),
+    frequency=NULL,
+    unique=NULL,
+    tzone=Sys.getenv("TZ"))
+```
+As mentioned previous, the two most important arguments are ```x``` and ```order.by```.  In fact, we only use these two arguments to create a xts object before.
+
+
+With a xts object, one can decompose it.
+
+### Deconstructing xts
+```coredata()``` is used to extract the data component
+```{r}
+head(coredata(X),5)
+```
+
+```index()``` is used to extract the index (aka times)
+```{r}
+head(index(X),5)
+```
+  
+### Conversion to xts from other time-series objects
+
+We will use the same dataset "bls_unemployment.csv" that we used in the last live session to illustarte the functions below.
+
+
+```{r}
+df <- read.csv("bls_unemployment.csv", header=TRUE, stringsAsFactors = FALSE)
+
+# Examine the data structure
+str(df)
+names(df)
+head(df)
+tail(df)
+
+#table(df$Series.id, useNA = "always")
+#table(df$Period, useNA = "always")
+
+# Convert a column of the data frame into a time-series object
+unemp <- ts(df$Value, start = c(2007,1), end = c(2017,1), frequency = 12)
+str(unemp)
+head(cbind(time(unemp), unemp),5)
+
+# Now, let's convert it to an xts object
+df_matrix <- as.matrix(df)
+head(df_matrix)
+str(df_matrix)
+rownames(df)
+
+unemp_idx <- seq(as.Date("2007/1/1"), by = "month", length.out = 
+                   length(df[,1]))
+head(unemp_idx)
+
+unemp_xts <- xts(df$Value, order.by = unemp_idx)
+str(unemp_xts)
+head(unemp_xts)
+```
+
+# Task 3:
+
+  1. Read 
+    A. Section 3.2 of "xts: Extensible Time Series" by Jeffrey A. Ryan and Joshua M. Ulrich
+    
+  2. Follow the following section of this document
+  
+# Merging and modifying time series
+
+One of the key strengths of ```xts``` is that it is easy to join data by column and row using a only few different functions. It makes creating time series datasets almost effortless.
+
+The important criterion is that the xts objects must be of identical type (e.g. integer + integer), or be POSIXct dates vector, or be atomic vectors of the same type (e.g. numeric), or be a single NA. It does not work on data.frames with various column types.
+
+The major functions is ```merge```.  It works like ```cbind``` or SQL's ```join```:
+
+Let's look at an example. It assumes that you are familiar with concepts of inner join, outer join, left join, and right join.
+
+```{r}
+library(quantmod)
+getSymbols("TWTR")
+head(TWTR)
+str(TWTR)
+```
+
+Note that the date obtained from the getSymbols function of the quantmod library is already an xts object.  As such, we can merge it directly with our unemployment rate xts object constructed above. Nevertheless, it is instructive to examine the data using the View() function to ensure that you understand the number of observations resulting from the joined series.
+
+```{r}
+# 1. Inner join
+TWTR_unemp01 <- merge(unemp_xts, TWTR, join = "inner")
+str(TWTR_unemp01)
+head(TWTR_unemp01)
+#View(TWTR_unemp01)
+
+# 2. Outer join (filling the missing observations with 99999)
+# Basic argument use
+TWTR_unemp02 <- merge(unemp_xts, TWTR, join = "outer", fill = 99999)
+str(TWTR_unemp02)
+head(TWTR_unemp02)
+#View(TWTR_unemp02)
+
+# Left join
+TWTR_unemp03 <- merge(unemp_xts, TWTR, join = "left", fill = 99999)
+str(TWTR_unemp03)
+head(TWTR_unemp03)
+#View(TWTR_unemp03)
+  
+# Right join
+TWTR_unemp04 <- merge(unemp_xts, TWTR, join = "right", fill = 99999)
+str(TWTR_unemp04)
+head(TWTR_unemp04)
+#View(TWTR_unemp04)
+```
+
+# Missing value imputation
+xts also offers methods that allows filling missing values using last or previous observation. Note that I include this simply to point out that this is possible. I by no mean certify that this is the preferred method of imputing missing values in a time series.  As I mentioned in live session, the specific method to use in missing value imputation is completely context dependent.
+
+Filling missing values from the last observation
+```{r}
+# First, let's replace the "99999" values with NA and then exammine the series. 
+
+# Let's examine the first few dozen observations with NA
+TWTR_unemp02['2013-10-01/2013-12-15'][,1]
+
+# Replace observations with "99999" with NA and store in a new series
+unemp01 <- TWTR_unemp02[, 1]
+unemp01['2013-10-01/2013-12-15']
+str(unemp01)
+head(unemp01)
+#TWTR_unemp02[, 1][TWTR_unemp02[, 1] >= 99990] <- NA
+
+unemp02 <- unemp01
+unemp02[unemp02 >= 99990] <- NA
+
+cbind(unemp01['2013-10-01/2013-12-15'], unemp02['2013-10-01/2013-12-15'])
+
+# Impute the missing values (stored as NA) with the last observation
+TWTR_unemp02_v2a <- na.locf(TWTR_unemp02[,1], 
+                            na.rm = TRUE, fromLast = TRUE) 
+unemp03 <- unemp02
+unemp03 <- na.locf(unemp03, na.rm = TRUE, fromLast = FALSE);
+
+# Examine the pre- and post-imputed series
+cbind(TWTR_unemp02['2013-10-01/2013-12-30'][,1],
+      TWTR_unemp02_v2a['2013-10-01/2013-12-15'])
+
+cbind(unemp01['2013-10-01/2013-12-15'],
+      unemp02['2013-10-01/2013-12-15'],
+      unemp03['2013-10-01/2013-12-15'])
+```
+
+Another missing value imputation method is linear interpolation, which can also be easily done in xts objects. In the following example, we use linear interpolation to fill in the NA in between months.  The result is stored in ```unemp04```. Note in the following the different ways of imputing missing values.
+
+```{r}
+unemp04 <- unemp02
+unemp04['2013-10-01/2014-02-01']
+unemp04 <- na.approx(unemp04, maxgap=31)
+unemp04['2013-10-01/2014-02-01']
+
+round(cbind(unemp01['2013-10-01/2013-12-15'],
+            unemp02['2013-10-01/2013-12-15'],
+            unemp03['2013-10-01/2013-12-15'],
+            unemp04['2013-10-01/2013-12-15']),2)
+```
+
+## Calculate difference in time series
+A very common operation on time series is to take a difference of the series to transform a non-stationary serier to a stationary series. First order differencing takes the form $x(t) - x(t-k)$ where $k$ denotes the number of time lags. Higher order differences are simply the reapplication of a difference to each prior result (like a second derivative or a difference of the difference).
+
+Let's use the ```unemp_xts``` series as examples:
+```{r}
+str(unemp_xts)
+unemp_xts
+ 
+diff(unemp_xts, lag = 1, difference = 1, log = FALSE, na.pad = TRUE)
+
+# calculate the first difference of AirPass using lag and subtraction
+#AirPass - lag(AirPass, k = 1)
+
+# calculate the first order 12-month difference if AirPass
+diff(unemp_xts, lag = 12, differences = 1)
+```
+
+# Task 4:
+
+1. Read 
+  + Section 3.4 of "xts: Extensible Time Series" by Jeffrey A. Ryan and Joshua M. Ulrich
+  + The following questions in "xts FAQ"
+    + I am using apply() to run a custom function on my xts series. Why the returned matrix has different dimensions than the original one?
+
+2. Follow the following two sections of this document
+
+# Apply various functions to time series
+
+The family of ```apply``` functions perhaps is one of the most powerful R function families. In time series, ```xts``` provides ```period.apply```, which takes (1) a time series, (2) an index of endpoints, and (3) a function to apply.  It takes the following general form:
+```
+period.apply(x, INDEX, FUN, ...)
+```
+
+As an example, we use the Twitter stock price series (to be precise, the daily closing price), create an index storing the points corresopnding to the weeks of the daily series, and apply functions to calculate the weekly mean. 
+
+```{r}
+# Step 1: Identify the endpoints; in this case, we use weekly time interval.
+# That is, we extract the end index on each week of the series
+
+#View(TWTR)
+head(TWTR)
+TWTR_ep <- endpoints(TWTR[,4], on = "weeks")
+#TWTR_ep
+
+# Step 2: Calculate the weekly mean
+TWTR.Close_weeklyMean <- period.apply(TWTR[, 4], INDEX = TWTR_ep, FUN = mean)
+head(round(TWTR.Close_weeklyMean,2),8)
+```
+
+The power of the apply function really comes with the use of custom-defined function. For instance, we can easily [note: Lab3.pdf setnence cuts off here]
+
+```{r}
+f <- function(x) {
+  mean <- mean(x)
+  quantile <- quantile(x,c(0.05,0.25,0.50,0.75,0.95))
+  sd <- sd(x)
+  
+  result <- c(mean, sd, quantile)
+  return(result)
+}
+head(round(period.apply(TWTR[, 4], INDEX = TWTR_ep, FUN = f),2),10)
+```
+
+# Calculate basic rolling statistics  of series by month
+Using ```rollapply```, one can calculate rolling statistics of a series:
+
+```{r}
+# Calculate rolling mean over a 10-day period and print it with
+# the original series
+head(cbind(TWTR[,4], rollapply(TWTR[, 4], 10, FUN = mean, na.rm = TRUE)),15)
+```
+
+# Task 5:
+1. Read AMAZ.csv and UMCSENT.csv into R as R DataFrames
+
+```{r}
+az_df <- read.csv("AMAZ.csv", header=TRUE, stringsAsFactors = FALSE)
+umc_df <- read.csv("UMCSENT.csv", header=TRUE, stringsAsFactors = FALSE)
+
+# Examine the data structure
+str(az_df)
+names(az_df)
+head(az_df)
+tail(az_df)
+
+# Examine the data structure
+str(umc_df)
+names(umc_df)
+head(umc_df)
+tail(umc_df)
+```
+
+
+2. Convert them to xts objects
+
+
+```{r}
+az_idx <- as.Date(az_df$Index)
+az_xts <- xts(az_df[,2:6], order.by = az_idx)
+str(az_xts)
+head(coredata(az_xts))
+tail(coredata(az_xts))
+head(index(az_xts))
+tail(index(az_xts))
+
+umc_xts <- xts(umc_df$UMCSENT, order.by = as.Date(umc_df$Index))
+str(umc_xts)
+head(coredata(umc_xts))
+tail(coredata(umc_xts))
+head(index(umc_xts))
+tail(index(umc_xts))
+```
+
+3. Merge the two set of series together, perserving all of the obserbvations in both set of series
+    
+  a. fill all of the missing values of the UMCSENT series with -9999
+
+```{r}
+mrgix01 <- merge(umc_xts,index(az_xts),join='outer',fill = -9999)
+mrg01 <- merge(mrgix01,az_xts,join='left')
+```
+    
+  b. then create a new series, named UMCSENT02, from the original UMCSENT series replace all of the -9999 with NAs
+
+```{r}
+UMCSENT02 <- mrg01$umc_xts
+UMCSENT02[UMCSENT02 <= -9999] <- NA
+```
+    
+  c. then create a new series, named UMCSENT03, and replace the NAs with the last observation
+
+```{r}
+UMCSENT03 <- UMCSENT02
+UMCSENT03 <- na.locf(UMCSENT02, na.rm = TRUE, fromLast = FALSE)
+```
+    
+  d. then create a new series, named UMCSENT04, and replace the NAs using linear interpolation.
+
+```{r}
+UMCSENT04 <- UMCSENT02
+UMCSENT04 <-na.approx(UMCSENT04, maxgap=31)
+```
+    
+  e. Print out some observations to ensure that your merge as well as the missing value imputation are done correctly. I leave it up to you to decide exactly how many observations to print; do something that makes sense. (Hint: Do not print out the entire dataset!)
+    
+```{r}
+#Before AMAZ series and then first couple months
+mrg01['2006-11-01/2007-03-01']
+UMCSENT02['2006-11-01/2007-03-01']
+UMCSENT03['2006-11-01/2007-03-01']
+UMCSENT04['2006-11-01/2007-03-01']
+```
+
+
+4. Calculate the daily return of the Amazon closing price (AMAZ.close), where daily return is defined as $(x(t)-x(t-1))/x(t-1)$. Plot the daily return series.
+
+```{r}
+rtrn <- 1 - diff.xts(az_xts$AMAZ.Close, lag = 1, difference = 1, 
+                arithmetic = F, na.pad=F)
+rtrn2 <- rtrn
+rtrn2 <- fortify(rtrn2)
+
+autoplot.zoo(rtrn, main = "AMAZ Daily Returns, Jan 2007-Jan 2013") +
+  labs(y = "Daily Return (%)", x = "Date")
+
+rtrn2 %>% mutate(pt=ifelse(abs(AMAZ.Close)>=.75,
+                           .75*sign(AMAZ.Close),NA)) %>%
+  mutate(ln=ifelse(abs(AMAZ.Close)>=.75,
+                           .75*sign(AMAZ.Close),AMAZ.Close)) %>%
+  ggplot() +
+  geom_line(aes(x = Index, y = ln)) +
+  geom_point(aes(x = Index, y = pt), na.rm = T,
+             color='red', size=3, label=pt) +
+  labs(title = "AMAZ Daily Returns, Jan 2007-Jan 2013",
+       y ="Daily Return (%)", x = "Date",
+       subtitle="Red points indicate return below -0.75%") +
+  geom_text(aes(x = Index, y=pt, label=round(AMAZ.Close,1)),
+            position=position_jitter(width=.02,height=.1),
+            hjust=1, vjust=1, size=4)
+```
+
+
+5. Create a 20-day and a 50-day rolling mean series from the AMAZ.close series.
+
+```{r}
+rm20 <- rollmean(az_xts$AMAZ.Close, k=20)
+head(rm20)
+tail(rm20)
+autoplot(rm20, main="AMAZ.Close, 20-Day Rolling Mean",
+         ylab="AMAZ.Close\n(20-Day Rolling Mean)")
+
+rm50 <- rollmean(az_xts$AMAZ.Close, k=50)
+head(rm50)
+tail(rm50)
+autoplot(rm50, main="AMAZ.Close, 50-Day Rolling Mean",
+         ylab="AMAZ.Close\n(50-Day Rolling Mean)")
+```
+
